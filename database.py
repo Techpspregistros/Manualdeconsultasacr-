@@ -114,6 +114,44 @@ class FAQ(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Procedure(Base):
+    __tablename__ = "procedures"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(80), default="", index=True)
+    title: Mapped[str] = mapped_column(String(260), index=True)
+    normalized_title: Mapped[str] = mapped_column(String(260), index=True)
+    domain: Mapped[str] = mapped_column(String(120), default="General")
+    objective: Mapped[str] = mapped_column(Text, default="")
+    steps_json: Mapped[str] = mapped_column(Text, default="[]")
+    requirements_json: Mapped[str] = mapped_column(Text, default="[]")
+    exceptions_json: Mapped[str] = mapped_column(Text, default="[]")
+    responsible: Mapped[str] = mapped_column(String(220), default="")
+    keywords: Mapped[str] = mapped_column(Text, default="")
+    related: Mapped[str] = mapped_column(Text, default="")
+    source_document: Mapped[str] = mapped_column(String(220), default="")
+    source_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    version: Mapped[str] = mapped_column(String(50), default="1.0")
+    status: Mapped[str] = mapped_column(String(30), default="draft", index=True)
+    created_by: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class KnowledgeRelation(Base):
+    __tablename__ = "knowledge_relations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_procedure_id: Mapped[int] = mapped_column(
+        ForeignKey("procedures.id", ondelete="CASCADE"), index=True
+    )
+    target_procedure_id: Mapped[int] = mapped_column(
+        ForeignKey("procedures.id", ondelete="CASCADE"), index=True
+    )
+    relation_type: Mapped[str] = mapped_column(String(80), default="related")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

@@ -17,7 +17,7 @@ import streamlit.components.v1 as components
 from sqlalchemy import func, select
 
 from database import (
-    AuditLog, Document, FAQ, Feedback, QueryLog, Synonym, User,
+    AuditLog, Document, FAQ, Feedback, Procedure, QueryLog, Synonym, User,
     db_session, init_db
 )
 from knowledge import (
@@ -26,6 +26,11 @@ from knowledge import (
 )
 from security import hash_password, initial_admin_password, verify_password
 from quality import promote_feedback_to_faq, quality_metrics, recurring_unresolved, similar_questions
+from knowledge_engine import (
+    compose_procedure_answer, delete_procedure, detect_procedure_candidates,
+    import_candidate, list_procedures, procedure_to_dict, save_procedure,
+    search_procedure,
+)
 
 
 BASE = Path(__file__).resolve().parent
@@ -34,7 +39,7 @@ DATA = BASE / "data"
 MANUALS.mkdir(exist_ok=True)
 DATA.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="ARC+ Enterprise v6", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="ARC+ Enterprise v7", page_icon="🧠", layout="wide")
 
 st.markdown("""
 <style>
@@ -191,7 +196,7 @@ def current_user():
 
 def login_screen():
     st.title("🧠 ARC+ Knowledge Assistant Enterprise")
-    st.caption("Plataforma inteligente de gestión del conocimiento — versión 6.2")
+    st.caption("Plataforma inteligente de gestión del conocimiento — versión 7.0")
     with st.form("login"):
         username = st.text_input("Usuario")
         password = st.text_input("Contraseña", type="password")
@@ -226,6 +231,8 @@ with st.sidebar:
     options = ["Asistente", "Biblioteca", "Mi historial"]
     if user["role"] in ("supervisor", "admin"):
         options += ["Analítica"]
+    if user["role"] in ("supervisor", "admin"):
+        options += ["Centro de conocimiento"]
     if user["role"] == "admin":
         options += ["Aprendizaje", "Usuarios", "Auditoría"]
     view = st.radio("Módulos", options)
@@ -314,17 +321,30 @@ if view == "Asistente":
         )
 
         faq = search_faq(search_question)
+        procedure_match = None if faq else search_procedure(search_question)
         results, intent, confidence, elapsed = search(
             search_question,
             limit=limit,
             categories=selected_categories or None,
         )
-        answer = compose_answer(
-            search_question,
-            results,
-            faq,
-            style=response_style,
-        )
+
+        if faq:
+            answer = compose_answer(
+                search_question, results, faq, style=response_style
+            )
+            answer_origin = "Respuesta oficial"
+        elif procedure_match:
+            answer = compose_procedure_answer(
+                procedure_match, style=response_style
+            )
+            confidence = procedure_match.confidence
+            intent = f"Procedimiento: {procedure_match.procedure.title}"
+            answer_origin = "Procedimiento estructurado"
+        else:
+            answer = compose_answer(
+                search_question, results, None, style=response_style
+            )
+            answer_origin = "Búsqueda documental"
 
         with db_session() as db:
             log = QueryLog(
@@ -358,6 +378,8 @@ if view == "Asistente":
             "query_id": query_id,
             "answer": answer,
             "style": response_style,
+            "procedure": procedure_to_dict(procedure_match.procedure) if procedure_match else None,
+            "answer_origin": answer_origin,
         }
         st.session_state["clear_question"] = True
         st.rerun()
@@ -372,6 +394,9 @@ if view == "Asistente":
             f"{confidence_icons.get(last['confidence'], '⚪')} {last['confidence']}",
         )
         m3.metric("Tiempo", f"{last['elapsed']} ms")
+        st.caption(
+            f"Origen de la respuesta: **{last.get('answer_origin', 'Búsqueda documental')}**"
+        )
 
         render_audio_reader(last["answer"], key=f"answer_{last['query_id']}")
 
@@ -388,7 +413,21 @@ if view == "Asistente":
         )
 
         with st.expander("📚 Ver fuentes utilizadas", expanded=False):
-            if not last["results"]:
+            procedure = last.get("procedure")
+            if procedure:
+                st.markdown(
+                    f"**Procedimiento estructurado: {procedure['title']}**"
+                )
+                st.caption(
+                    f"Código: {procedure['code'] or '—'} · "
+                    f"Versión: {procedure['version']} · "
+                    f"Documento fuente: {procedure['source_document'] or '—'}"
+                )
+                if procedure["related"]:
+                    st.write("**Relacionado con:**", procedure["related"])
+                st.divider()
+
+            if not last["results"] and not procedure:
                 st.info("No se localizaron fuentes documentales suficientes.")
             for i, r in enumerate(last["results"], 1):
                 st.markdown(f"**{i}. {r.title}**")
@@ -673,6 +712,161 @@ elif view == "Analítica":
             df.groupby("Tema", as_index=False)["Tiempo_ms"].mean().sort_values("Tiempo_ms", ascending=False),
             use_container_width=True, hide_index=True
         )
+
+elif view == "Centro de conocimiento":
+    st.title("🧠 Centro de conocimiento")
+    st.caption(
+        "Los procedimientos aprobados tienen prioridad sobre los fragmentos de PDF."
+    )
+
+    approved = list_procedures(status="approved")
+    drafts = list_procedures(status="draft")
+    inactive = list_procedures(status="inactive")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Aprobados", len(approved))
+    c2.metric("Borradores", len(drafts))
+    c3.metric("Inactivos", len(inactive))
+
+    tabs = st.tabs(["Procedimientos", "Crear procedimiento", "Detectar desde manuales"])
+
+    with tabs[0]:
+        filter_status = st.selectbox(
+            "Estado", ["Todos", "approved", "draft", "inactive"]
+        )
+        procedure_query = st.text_input("Buscar procedimiento")
+        rows = list_procedures(
+            status=None if filter_status == "Todos" else filter_status,
+            query=procedure_query,
+        )
+        for item in rows:
+            with st.expander(
+                f"{item['status']} · {item['code'] or 'Sin código'} · {item['title']}"
+            ):
+                st.write(item["objective"] or "Sin objetivo registrado.")
+                for index, step in enumerate(item["steps"], 1):
+                    st.write(f"{index}. {step}")
+                st.caption(
+                    f"Dominio: {item['domain']} · Versión: {item['version']} · "
+                    f"Fuente: {item['source_document'] or '—'}"
+                )
+                if user["role"] == "admin":
+                    with st.form(f"edit_procedure_{item['id']}"):
+                        ec1, ec2, ec3 = st.columns(3)
+                        code = ec1.text_input("Código", item["code"])
+                        title = ec2.text_input("Título", item["title"])
+                        domain = ec3.text_input("Dominio", item["domain"])
+                        objective = st.text_area("Objetivo", item["objective"])
+                        steps = st.text_area("Pasos, uno por línea", "\n".join(item["steps"]))
+                        requirements = st.text_area(
+                            "Requisitos, uno por línea", "\n".join(item["requirements"])
+                        )
+                        exceptions = st.text_area(
+                            "Excepciones, una por línea", "\n".join(item["exceptions"])
+                        )
+                        ec4, ec5, ec6 = st.columns(3)
+                        responsible = ec4.text_input("Responsable", item["responsible"])
+                        version = ec5.text_input("Versión", item["version"])
+                        status = ec6.selectbox(
+                            "Estado", ["draft", "approved", "inactive"],
+                            index=["draft", "approved", "inactive"].index(item["status"]),
+                        )
+                        keywords = st.text_input("Palabras clave", item["keywords"])
+                        related = st.text_input("Relacionado con", item["related"])
+                        sc1, sc2 = st.columns(2)
+                        source_document = sc1.text_input(
+                            "Documento fuente", item["source_document"]
+                        )
+                        source_page = sc2.number_input(
+                            "Página de referencia", min_value=0,
+                            value=int(item["source_page"] or 0), step=1
+                        )
+                        if st.form_submit_button("Guardar cambios"):
+                            save_procedure(
+                                procedure_id=item["id"], code=code, title=title,
+                                domain=domain, objective=objective, steps=steps,
+                                requirements=requirements, exceptions=exceptions,
+                                responsible=responsible, keywords=keywords,
+                                related=related, source_document=source_document,
+                                source_page=int(source_page) if source_page else None,
+                                version=version, status=status,
+                                username=user["username"],
+                            )
+                            audit(user["username"], "UPDATE_PROCEDURE", title)
+                            st.success("Procedimiento actualizado.")
+                            st.rerun()
+
+                    confirm = st.checkbox(
+                        "Confirmo la eliminación",
+                        key=f"confirm_delete_procedure_{item['id']}",
+                    )
+                    if st.button(
+                        "🗑 Eliminar procedimiento",
+                        key=f"delete_procedure_{item['id']}",
+                        disabled=not confirm,
+                    ):
+                        delete_procedure(item["id"])
+                        audit(user["username"], "DELETE_PROCEDURE", item["title"])
+                        st.rerun()
+
+    with tabs[1]:
+        if user["role"] != "admin":
+            st.info("Solo un administrador puede crear procedimientos.")
+        else:
+            with st.form("create_procedure"):
+                nc1, nc2, nc3 = st.columns(3)
+                code = nc1.text_input("Código", placeholder="2.6.2.3")
+                title = nc2.text_input("Título", placeholder="Realizar pre-cierre")
+                domain = nc3.text_input("Dominio", value="Contratos")
+                objective = st.text_area("Objetivo")
+                steps = st.text_area("Pasos, uno por línea")
+                requirements = st.text_area("Requisitos, uno por línea")
+                exceptions = st.text_area("Excepciones, una por línea")
+                nc4, nc5 = st.columns(2)
+                responsible = nc4.text_input("Responsable")
+                version = nc5.text_input("Versión", value="1.0")
+                keywords = st.text_input("Palabras clave")
+                related = st.text_input("Relacionado con")
+                nc6, nc7 = st.columns(2)
+                source_document = nc6.text_input("Documento fuente")
+                source_page = nc7.number_input(
+                    "Página de referencia", min_value=0, step=1
+                )
+                status = st.selectbox("Estado", ["draft", "approved"])
+                if st.form_submit_button("Crear procedimiento"):
+                    new_id = save_procedure(
+                        code=code, title=title, domain=domain,
+                        objective=objective, steps=steps,
+                        requirements=requirements, exceptions=exceptions,
+                        responsible=responsible, keywords=keywords,
+                        related=related, source_document=source_document,
+                        source_page=int(source_page) if source_page else None,
+                        version=version, status=status,
+                        username=user["username"],
+                    )
+                    audit(user["username"], "CREATE_PROCEDURE", f"{new_id}:{title}")
+                    st.success("Procedimiento creado.")
+                    st.rerun()
+
+    with tabs[2]:
+        candidates = detect_procedure_candidates()
+        st.metric("Candidatos detectados", len(candidates))
+        for index, candidate in enumerate(candidates[:100]):
+            with st.expander(
+                f"{candidate['code']} · {candidate['title']} · "
+                f"{candidate['source_document']}"
+            ):
+                st.write(candidate["excerpt"])
+                if user["role"] == "admin" and st.button(
+                    "Importar como borrador", key=f"import_candidate_{index}"
+                ):
+                    procedure_id = import_candidate(
+                        candidate, username=user["username"]
+                    )
+                    audit(
+                        user["username"], "IMPORT_PROCEDURE_CANDIDATE",
+                        f"{procedure_id}:{candidate['title']}",
+                    )
+                    st.rerun()
 
 elif view == "Aprendizaje":
     st.title("🧠 Aprendizaje supervisado y calidad")
