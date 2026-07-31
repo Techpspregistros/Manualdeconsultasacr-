@@ -25,6 +25,7 @@ from knowledge import (
     normalize, render_page, search, search_faq, seed_synonyms, update_document_metadata
 )
 from security import hash_password, initial_admin_password, verify_password
+from quality import promote_feedback_to_faq, quality_metrics, recurring_unresolved, similar_questions
 
 
 BASE = Path(__file__).resolve().parent
@@ -190,7 +191,7 @@ def current_user():
 
 def login_screen():
     st.title("🧠 ARC+ Knowledge Assistant Enterprise")
-    st.caption("Plataforma inteligente de gestión del conocimiento — versión 6.1")
+    st.caption("Plataforma inteligente de gestión del conocimiento — versión 6.2")
     with st.form("login"):
         username = st.text_input("Usuario")
         password = st.text_input("Contraseña", type="password")
@@ -404,6 +405,17 @@ if view == "Asistente":
                     except Exception as exc:
                         st.warning(f"No se pudo mostrar la página: {exc}")
                 st.divider()
+
+        similar = similar_questions(last["question"], limit=5)
+        if similar:
+            with st.expander("🔎 Consultas similares realizadas anteriormente", expanded=False):
+                for item in similar:
+                    status = "Resuelta" if item["resolved"] else "Pendiente"
+                    st.markdown(
+                        f"- **{item['question']}**  \\n"
+                        f"  Similitud: {item['score']:.0%} · {status} · "
+                        f"Confianza: {item['confidence'] or '—'}"
+                    )
 
         if last["confidence"] == "Baja":
             st.warning(
@@ -663,8 +675,22 @@ elif view == "Analítica":
         )
 
 elif view == "Aprendizaje":
-    st.title("Aprendizaje supervisado")
-    tabs = st.tabs(["Pendientes", "Sinónimos", "Preguntas frecuentes"])
+    st.title("🧠 Aprendizaje supervisado y calidad")
+
+    metrics = quality_metrics()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Consultas", metrics["total"])
+    m2.metric("Tasa resuelta", f"{metrics['resolution_rate']}%")
+    m3.metric("Confianza baja", metrics["low_confidence"])
+    m4.metric("Por revisar", metrics["pending_feedback"])
+    m5.metric("Respuestas oficiales", metrics["official_faqs"])
+
+    tabs = st.tabs([
+        "Retroalimentación pendiente",
+        "Preguntas recurrentes",
+        "Sinónimos",
+        "Respuestas oficiales",
+    ])
 
     with tabs[0]:
         with db_session() as db:
@@ -674,15 +700,44 @@ elif view == "Aprendizaje":
                 .where(Feedback.reviewed == False)
                 .order_by(Feedback.id.desc())
             ).all()
+
         if not feedback:
             st.success("No hay retroalimentaciones pendientes.")
+
         for fb, q in feedback:
-            with st.expander(f"#{fb.id} · {fb.rating} · {q.question[:90]}"):
+            label = f"#{fb.id} · {fb.rating} · {q.question[:90]}"
+            with st.expander(label):
                 st.write("**Pregunta:**", q.question)
-                st.write("**Respuesta encontrada:**", q.result_title, q.document_name, q.page_number)
+                st.write("**Tema detectado:**", q.intent or "—")
+                st.write("**Confianza:**", q.confidence or "—")
+                st.write("**Documento encontrado:**", q.document_name or "—")
                 st.write("**Comentario:**", fb.comment or "—")
                 st.write("**Solución real:**", fb.final_solution or "—")
-                if st.button("Marcar revisada", key=f"review_{fb.id}"):
+
+                c1, c2 = st.columns(2)
+                if c1.button(
+                    "✅ Convertir en respuesta oficial",
+                    key=f"promote_{fb.id}",
+                    disabled=not bool((fb.final_solution or fb.comment or "").strip()),
+                    use_container_width=True,
+                ):
+                    try:
+                        faq_id = promote_feedback_to_faq(fb.id)
+                        audit(
+                            user["username"],
+                            "PROMOTE_FEEDBACK_TO_FAQ",
+                            f"Feedback {fb.id} -> FAQ {faq_id}",
+                        )
+                        st.success("La solución quedó disponible como respuesta oficial.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+                if c2.button(
+                    "Marcar revisada sin publicar",
+                    key=f"review_{fb.id}",
+                    use_container_width=True,
+                ):
                     with db_session() as db:
                         row = db.get(Feedback, fb.id)
                         row.reviewed = True
@@ -691,54 +746,130 @@ elif view == "Aprendizaje":
                     st.rerun()
 
     with tabs[1]:
+        st.caption(
+            "Agrupa preguntas no resueltas o de confianza baja para identificar "
+            "vacíos de documentación."
+        )
+        recurring = recurring_unresolved(limit=25)
+        if not recurring:
+            st.success("No hay preguntas recurrentes pendientes.")
+        for i, item in enumerate(recurring, 1):
+            with st.expander(
+                f"{i}. {item['sample'][:100]} · {item['count']} consultas"
+            ):
+                st.write("**Tema:**", item["intent"] or "General")
+                st.write("**Última consulta:**", item["latest"])
+                st.write("**Variantes encontradas:**")
+                for question_variant in item["questions"][:10]:
+                    st.markdown(f"- {question_variant}")
+
+    with tabs[2]:
         with st.form("synonym_form"):
             expression = st.text_input("Expresión del usuario", placeholder="RA")
             concept = st.text_input("Concepto oficial", placeholder="contrato")
             save = st.form_submit_button("Agregar")
         if save and expression.strip() and concept.strip():
             with db_session() as db:
-                existing = db.scalar(select(Synonym).where(Synonym.expression == normalize(expression)))
+                existing = db.scalar(
+                    select(Synonym).where(
+                        Synonym.expression == normalize(expression)
+                    )
+                )
                 if existing:
                     existing.concept = normalize(concept)
                     existing.approved = True
                 else:
-                    db.add(Synonym(expression=normalize(expression), concept=normalize(concept), approved=True))
+                    db.add(Synonym(
+                        expression=normalize(expression),
+                        concept=normalize(concept),
+                        approved=True,
+                    ))
                 db.commit()
             audit(user["username"], "UPSERT_SYNONYM", f"{expression}={concept}")
             st.success("Sinónimo guardado.")
             st.rerun()
-        with db_session() as db:
-            syns = db.scalars(select(Synonym).order_by(Synonym.concept, Synonym.expression)).all()
-        st.dataframe(pd.DataFrame([{
-            "ID": s.id, "Expresión": s.expression, "Concepto": s.concept, "Aprobado": s.approved
-        } for s in syns]), use_container_width=True, hide_index=True)
 
-    with tabs[2]:
+        with db_session() as db:
+            syns = db.scalars(
+                select(Synonym).order_by(Synonym.concept, Synonym.expression)
+            ).all()
+        st.dataframe(
+            pd.DataFrame([{
+                "ID": s.id,
+                "Expresión": s.expression,
+                "Concepto": s.concept,
+                "Aprobado": s.approved,
+            } for s in syns]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabs[3]:
         with st.form("faq_form"):
             fq = st.text_input("Pregunta")
             answer = st.text_area("Respuesta oficial")
             keywords = st.text_input("Palabras clave")
             source = st.text_input("Documento fuente")
             page = st.number_input("Página PDF", min_value=0, step=1)
-            save_faq = st.form_submit_button("Guardar FAQ")
+            save_faq = st.form_submit_button("Guardar respuesta oficial")
+
         if save_faq and fq.strip() and answer.strip():
             with db_session() as db:
                 db.add(FAQ(
-                    question=fq.strip(), normalized_question=normalize(fq),
-                    answer=answer.strip(), keywords=keywords.strip(),
-                    document_name=source.strip(), page_number=int(page) if page else None,
-                    active=True
+                    question=fq.strip(),
+                    normalized_question=normalize(fq),
+                    answer=answer.strip(),
+                    keywords=keywords.strip(),
+                    document_name=source.strip(),
+                    page_number=int(page) if page else None,
+                    active=True,
                 ))
                 db.commit()
             audit(user["username"], "CREATE_FAQ", fq)
             st.success("Respuesta oficial guardada.")
             st.rerun()
+
         with db_session() as db:
             faqs = db.scalars(select(FAQ).order_by(FAQ.id.desc())).all()
-        st.dataframe(pd.DataFrame([{
-            "ID": f.id, "Pregunta": f.question, "Documento": f.document_name,
-            "Página": f.page_number, "Activa": f.active
-        } for f in faqs]), use_container_width=True, hide_index=True)
+
+        for faq in faqs:
+            with st.expander(
+                f"#{faq.id} · {faq.question[:95]} · "
+                f"{'Activa' if faq.active else 'Inactiva'}"
+            ):
+                st.write(faq.answer)
+                st.caption(
+                    f"Documento: {faq.document_name or '—'} · "
+                    f"Palabras clave: {faq.keywords or '—'}"
+                )
+                c1, c2 = st.columns(2)
+                if c1.button(
+                    "Activar" if not faq.active else "Desactivar",
+                    key=f"toggle_faq_{faq.id}",
+                    use_container_width=True,
+                ):
+                    with db_session() as db:
+                        row = db.get(FAQ, faq.id)
+                        row.active = not row.active
+                        db.commit()
+                    audit(
+                        user["username"],
+                        "TOGGLE_FAQ",
+                        f"{faq.id}:{not faq.active}",
+                    )
+                    st.rerun()
+
+                if c2.button(
+                    "Eliminar respuesta oficial",
+                    key=f"delete_faq_{faq.id}",
+                    use_container_width=True,
+                ):
+                    with db_session() as db:
+                        row = db.get(FAQ, faq.id)
+                        db.delete(row)
+                        db.commit()
+                    audit(user["username"], "DELETE_FAQ", str(faq.id))
+                    st.rerun()
 
 elif view == "Usuarios":
     st.title("Usuarios y permisos")
