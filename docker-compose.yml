@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: arcplus
+      POSTGRES_USER: arcplus
+      POSTGRES_PASSWORD: cambiar_password_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://arcplus:cambiar_password_db@db:5432/arcplus
+      ARCPLUS_ADMIN_PASSWORD: Cambiar123!
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./manuals:/app/manuals
+    depends_on:
+      - db
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
