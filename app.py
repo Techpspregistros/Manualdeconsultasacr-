@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import csv
+import html
 import io
+import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import func, select
 
 from database import (
@@ -39,6 +43,114 @@ st.markdown("""
 .source {font-size:.86rem;color:#555;}
 </style>
 """, unsafe_allow_html=True)
+
+
+def answer_to_plain_text(markdown_text: str) -> str:
+    """Convert the assistant Markdown response into clean text for speech."""
+    text = re.sub(r"```.*?```", " ", markdown_text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"[*_~>]", "", text)
+    text = re.sub(r"^\s*[-+•]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return html.unescape(text)
+
+
+def render_audio_reader(answer: str, key: str = "answer") -> None:
+    """Render a no-cost browser-based Spanish text-to-speech reader."""
+    speech_text = answer_to_plain_text(answer)
+    if not speech_text:
+        return
+
+    safe_text = json.dumps(speech_text, ensure_ascii=False)
+    component_id = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
+    components.html(
+        f"""
+        <div id="arc-tts-{component_id}" style="font-family: Arial, sans-serif; border:1px solid #e5e7eb;
+             border-radius:12px; padding:14px; background:#fafafa;">
+          <div style="font-weight:700; margin-bottom:10px;">🔊 Asistente de lectura</div>
+          <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+            <button id="play-{component_id}" style="padding:8px 12px; cursor:pointer;">▶ Escuchar</button>
+            <button id="pause-{component_id}" style="padding:8px 12px; cursor:pointer;">⏸ Pausar</button>
+            <button id="resume-{component_id}" style="padding:8px 12px; cursor:pointer;">⏯ Continuar</button>
+            <button id="stop-{component_id}" style="padding:8px 12px; cursor:pointer;">⏹ Detener</button>
+            <label style="margin-left:4px;">Velocidad
+              <select id="rate-{component_id}" style="padding:7px; margin-left:4px;">
+                <option value="0.8">0.8×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.2">1.2×</option>
+                <option value="1.4">1.4×</option>
+              </select>
+            </label>
+            <label>Voz
+              <select id="voice-{component_id}" style="padding:7px; margin-left:4px; max-width:260px;"></select>
+            </label>
+          </div>
+          <div id="status-{component_id}" style="font-size:13px; color:#555; margin-top:9px;">Listo para leer.</div>
+        </div>
+        <script>
+          (() => {{
+            const text = {safe_text};
+            const synth = window.speechSynthesis;
+            const voiceSelect = document.getElementById('voice-{component_id}');
+            const rateSelect = document.getElementById('rate-{component_id}');
+            const status = document.getElementById('status-{component_id}');
+            let utterance = null;
+            let voices = [];
+
+            function loadVoices() {{
+              voices = synth.getVoices();
+              const spanish = voices.filter(v => (v.lang || '').toLowerCase().startsWith('es'));
+              const options = spanish.length ? spanish : voices;
+              voiceSelect.innerHTML = '';
+              options.forEach((voice) => {{
+                const option = document.createElement('option');
+                option.value = voices.indexOf(voice);
+                option.textContent = `${{voice.name}} (${{voice.lang}})`;
+                voiceSelect.appendChild(option);
+              }});
+              const preferred = options.find(v => /costa rica|es-cr/i.test(`${{v.name}} ${{v.lang}}`))
+                || options.find(v => /mex|latin|es-419/i.test(`${{v.name}} ${{v.lang}}`))
+                || options[0];
+              if (preferred) voiceSelect.value = voices.indexOf(preferred);
+            }}
+
+            loadVoices();
+            if ('onvoiceschanged' in synth) synth.onvoiceschanged = loadVoices;
+
+            document.getElementById('play-{component_id}').onclick = () => {{
+              synth.cancel();
+              utterance = new SpeechSynthesisUtterance(text);
+              utterance.lang = 'es-CR';
+              utterance.rate = Number(rateSelect.value || 1);
+              const selectedVoice = voices[Number(voiceSelect.value)];
+              if (selectedVoice) utterance.voice = selectedVoice;
+              utterance.onstart = () => status.textContent = 'Leyendo la respuesta…';
+              utterance.onpause = () => status.textContent = 'Lectura pausada.';
+              utterance.onresume = () => status.textContent = 'Continuando la lectura…';
+              utterance.onend = () => status.textContent = 'Lectura finalizada.';
+              utterance.onerror = (event) => status.textContent = `No se pudo reproducir el audio: ${{event.error || 'error del navegador'}}.`;
+              synth.speak(utterance);
+            }};
+            document.getElementById('pause-{component_id}').onclick = () => {{
+              if (synth.speaking && !synth.paused) synth.pause();
+            }};
+            document.getElementById('resume-{component_id}').onclick = () => {{
+              if (synth.paused) synth.resume();
+            }};
+            document.getElementById('stop-{component_id}').onclick = () => {{
+              synth.cancel();
+              status.textContent = 'Lectura detenida.';
+            }};
+            window.addEventListener('beforeunload', () => synth.cancel());
+          }})();
+        </script>
+        """,
+        height=145,
+        scrolling=False,
+    )
 
 
 def audit(username: str, action: str, detail: str = ""):
@@ -186,6 +298,7 @@ if view == "Asistente":
         m2.metric("Confianza", last["confidence"])
         m3.metric("Tiempo", f"{last['elapsed']} ms")
         st.markdown(last["answer"])
+        render_audio_reader(last["answer"], key=f"answer_{last['query_id']}")
 
         text_export = (
             f"ARC+ ENTERPRISE V4\nFecha: {datetime.now():%Y-%m-%d %H:%M}\n"
