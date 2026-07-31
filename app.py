@@ -17,7 +17,7 @@ import streamlit.components.v1 as components
 from sqlalchemy import func, select
 
 from database import (
-    AuditLog, Document, FAQ, Feedback, Procedure, QueryLog, Synonym, User,
+    AuditLog, BusinessIntent, Document, FAQ, Feedback, Procedure, QueryLog, Synonym, User,
     db_session, init_db
 )
 from knowledge import (
@@ -31,6 +31,11 @@ from knowledge_engine import (
     import_candidate, list_procedures, procedure_to_dict, save_procedure,
     search_procedure,
 )
+from intent_engine import (
+    delete_intent, detect_intent, ensure_intent_for_procedure, list_intents,
+    route_question, save_intent, seed_business_intents,
+    sync_approved_procedure_intents,
+)
 
 
 BASE = Path(__file__).resolve().parent
@@ -39,7 +44,7 @@ DATA = BASE / "data"
 MANUALS.mkdir(exist_ok=True)
 DATA.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="ARC+ Enterprise v7", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="ARC+ Enterprise v8.1", page_icon="🧠", layout="wide")
 
 st.markdown("""
 <style>
@@ -196,7 +201,7 @@ def current_user():
 
 def login_screen():
     st.title("🧠 ARC+ Knowledge Assistant Enterprise")
-    st.caption("Plataforma inteligente de gestión del conocimiento — versión 7.0")
+    st.caption("Plataforma inteligente de gestión del conocimiento — versión 8.1")
     with st.form("login"):
         username = st.text_input("Usuario")
         password = st.text_input("Contraseña", type="password")
@@ -321,7 +326,9 @@ if view == "Asistente":
         )
 
         faq = search_faq(search_question)
-        procedure_match = None if faq else search_procedure(search_question)
+        route = route_question(search_question) if not faq else None
+        procedure_match = route.procedure if route else None
+
         results, intent, confidence, elapsed = search(
             search_question,
             limit=limit,
@@ -333,17 +340,25 @@ if view == "Asistente":
                 search_question, results, faq, style=response_style
             )
             answer_origin = "Respuesta oficial"
-        elif procedure_match:
+        elif route and route.route == "procedure" and procedure_match:
             answer = compose_procedure_answer(
                 procedure_match, style=response_style
             )
             confidence = procedure_match.confidence
-            intent = f"Procedimiento: {procedure_match.procedure.title}"
-            answer_origin = "Procedimiento estructurado"
+            intent = f"Proceso: {route.intent.name}"
+            answer_origin = "Proceso de negocio estructurado"
+        elif route and route.route == "blocked":
+            answer = "### Conocimiento pendiente de aprobación\n\n" + route.message
+            confidence = "Baja"
+            intent = f"Proceso detectado: {route.intent.name}"
+            answer_origin = "Protección contra respuesta incorrecta"
+            results = []
         else:
             answer = compose_answer(
                 search_question, results, None, style=response_style
             )
+            if route and route.intent:
+                intent = f"Proceso detectado: {route.intent.name}"
             answer_origin = "Búsqueda documental"
 
         with db_session() as db:
@@ -380,6 +395,12 @@ if view == "Asistente":
             "style": response_style,
             "procedure": procedure_to_dict(procedure_match.procedure) if procedure_match else None,
             "answer_origin": answer_origin,
+            "business_intent": {
+                "code": route.intent.code,
+                "name": route.intent.name,
+                "score": route.intent.score,
+                "matched_alias": route.intent.matched_alias,
+            } if route and route.intent else None,
         }
         st.session_state["clear_question"] = True
         st.rerun()
@@ -397,6 +418,12 @@ if view == "Asistente":
         st.caption(
             f"Origen de la respuesta: **{last.get('answer_origin', 'Búsqueda documental')}**"
         )
+        business_intent = last.get("business_intent")
+        if business_intent:
+            st.caption(
+                f"Proceso detectado: **{business_intent['name']}** · "
+                f"Coincidencia: {business_intent['score']:.0%}"
+            )
 
         render_audio_reader(last["answer"], key=f"answer_{last['query_id']}")
 
@@ -716,8 +743,18 @@ elif view == "Analítica":
 elif view == "Centro de conocimiento":
     st.title("🧠 Centro de conocimiento")
     st.caption(
-        "Los procedimientos aprobados tienen prioridad sobre los fragmentos de PDF."
+        "Los procedimientos aprobados tienen prioridad sobre los fragmentos de PDF. "
+        "Cada procedimiento aprobado genera automáticamente su comprensión de IA."
     )
+    if user["role"] == "admin":
+        if st.button("🔄 Sincronizar comprensión de todos los procedimientos"):
+            synced = sync_approved_procedure_intents()
+            audit(
+                user["username"],
+                "SYNC_PROCEDURE_INTENTS",
+                f"{synced} procedimientos",
+            )
+            st.success(f"Se sincronizaron {synced} procedimientos aprobados.")
 
     approved = list_procedures(status="approved")
     drafts = list_procedures(status="draft")
@@ -727,7 +764,7 @@ elif view == "Centro de conocimiento":
     c2.metric("Borradores", len(drafts))
     c3.metric("Inactivos", len(inactive))
 
-    tabs = st.tabs(["Procedimientos", "Crear procedimiento", "Detectar desde manuales"])
+    tabs = st.tabs(["Procedimientos", "Crear procedimiento", "Catálogo funcional", "Detectar desde manuales"])
 
     with tabs[0]:
         filter_status = st.selectbox(
@@ -739,8 +776,13 @@ elif view == "Centro de conocimiento":
             query=procedure_query,
         )
         for item in rows:
+            status_display = {
+                "approved": "✅ Aprobado",
+                "draft": "📝 Borrador",
+                "inactive": "⏸ Inactivo",
+            }.get(item["status"], item["status"])
             with st.expander(
-                f"{item['status']} · {item['code'] or 'Sin código'} · {item['title']}"
+                f"{status_display} · {item['code'] or 'Sin código'} · {item['title']}"
             ):
                 st.write(item["objective"] or "Sin objetivo registrado.")
                 for index, step in enumerate(item["steps"], 1):
@@ -781,7 +823,7 @@ elif view == "Centro de conocimiento":
                             value=int(item["source_page"] or 0), step=1
                         )
                         if st.form_submit_button("Guardar cambios"):
-                            save_procedure(
+                            saved_id = save_procedure(
                                 procedure_id=item["id"], code=code, title=title,
                                 domain=domain, objective=objective, steps=steps,
                                 requirements=requirements, exceptions=exceptions,
@@ -791,6 +833,8 @@ elif view == "Centro de conocimiento":
                                 version=version, status=status,
                                 username=user["username"],
                             )
+                            if status == "approved":
+                                ensure_intent_for_procedure(saved_id)
                             audit(user["username"], "UPDATE_PROCEDURE", title)
                             st.success("Procedimiento actualizado.")
                             st.rerun()
@@ -833,21 +877,155 @@ elif view == "Centro de conocimiento":
                 )
                 status = st.selectbox("Estado", ["draft", "approved"])
                 if st.form_submit_button("Crear procedimiento"):
-                    new_id = save_procedure(
-                        code=code, title=title, domain=domain,
-                        objective=objective, steps=steps,
-                        requirements=requirements, exceptions=exceptions,
-                        responsible=responsible, keywords=keywords,
-                        related=related, source_document=source_document,
-                        source_page=int(source_page) if source_page else None,
-                        version=version, status=status,
-                        username=user["username"],
-                    )
-                    audit(user["username"], "CREATE_PROCEDURE", f"{new_id}:{title}")
-                    st.success("Procedimiento creado.")
-                    st.rerun()
+                    errors = []
+                    if not title.strip():
+                        errors.append("Ingrese el título del procedimiento.")
+                    if not objective.strip():
+                        errors.append("Ingrese el objetivo del procedimiento.")
+                    if not any(line.strip() for line in steps.splitlines()):
+                        errors.append("Ingrese al menos un paso.")
+                    if errors:
+                        for error in errors:
+                            st.error(error)
+                    else:
+                        try:
+                            new_id = save_procedure(
+                                code=code, title=title, domain=domain,
+                                objective=objective, steps=steps,
+                                requirements=requirements, exceptions=exceptions,
+                                responsible=responsible, keywords=keywords,
+                                related=related, source_document=source_document,
+                                source_page=int(source_page) if source_page else None,
+                                version=version, status=status,
+                                username=user["username"],
+                            )
+                            if status == "approved":
+                                ensure_intent_for_procedure(new_id)
+                            audit(
+                                user["username"],
+                                "CREATE_PROCEDURE",
+                                f"{new_id}:{title}",
+                            )
+                            st.success("Procedimiento creado y sincronizado.")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+
 
     with tabs[2]:
+        st.subheader("Catálogo funcional de procesos")
+        st.caption(
+            "Este catálogo identifica la intención real del usuario antes de buscar "
+            "en documentos. Las intenciones estrictas bloquean una respuesta documental "
+            "cuando no existe un procedimiento aprobado, evitando mezclar procesos."
+        )
+
+        intents = list_intents()
+        for item in intents:
+            state = "Activo" if item["active"] else "Inactivo"
+            strict_label = "Estricto" if item["strict"] else "Flexible"
+            with st.expander(
+                f"{state} · {strict_label} · {item['code']} · {item['name']}"
+            ):
+                st.write("**Alias:**", ", ".join(item["aliases"]) or "—")
+                st.write(
+                    "**Términos excluidos:**",
+                    ", ".join(item["blocked_terms"]) or "—",
+                )
+                st.write(
+                    "**Procedimiento objetivo:**",
+                    item["target_procedure_title"] or item["name"],
+                )
+
+                if user["role"] == "admin":
+                    with st.form(f"edit_intent_{item['id']}"):
+                        ic1, ic2 = st.columns(2)
+                        code = ic1.text_input("Código", item["code"])
+                        name = ic2.text_input("Nombre del proceso", item["name"])
+                        aliases = st.text_area(
+                            "Alias, separados por coma o línea",
+                            "\n".join(item["aliases"]),
+                        )
+                        blocked_terms = st.text_area(
+                            "Términos excluidos",
+                            "\n".join(item["blocked_terms"]),
+                        )
+                        target = st.text_input(
+                            "Título del procedimiento objetivo",
+                            item["target_procedure_title"],
+                        )
+                        ic3, ic4 = st.columns(2)
+                        strict = ic3.checkbox(
+                            "Bloquear búsqueda documental si falta el procedimiento",
+                            value=item["strict"],
+                        )
+                        active = ic4.checkbox("Activo", value=item["active"])
+                        if st.form_submit_button("Guardar intención"):
+                            save_intent(
+                                intent_id=item["id"],
+                                code=code,
+                                name=name,
+                                aliases=aliases,
+                                blocked_terms=blocked_terms,
+                                target_procedure_title=target,
+                                strict=strict,
+                                active=active,
+                            )
+                            audit(
+                                user["username"],
+                                "UPDATE_BUSINESS_INTENT",
+                                f"{item['id']}:{code}",
+                            )
+                            st.success("Intención actualizada.")
+                            st.rerun()
+
+        if user["role"] == "admin":
+            st.divider()
+            st.subheader("Crear una intención")
+            with st.form("create_business_intent"):
+                ni1, ni2 = st.columns(2)
+                new_code = ni1.text_input(
+                    "Código funcional", placeholder="EXTENSION_CONTRATO"
+                )
+                new_name = ni2.text_input(
+                    "Nombre del proceso", placeholder="Extensión del contrato"
+                )
+                new_aliases = st.text_area(
+                    "Alias",
+                    placeholder="extender contrato\nampliar contrato\nextensión",
+                )
+                new_blocked = st.text_area("Términos excluidos")
+                new_target = st.text_input(
+                    "Procedimiento objetivo",
+                    placeholder="Extensión del contrato",
+                )
+                ni3, ni4 = st.columns(2)
+                new_strict = ni3.checkbox(
+                    "Intención estricta", value=True
+                )
+                new_active = ni4.checkbox("Activa", value=True)
+                if st.form_submit_button("Crear intención"):
+                    try:
+                        intent_id = save_intent(
+                            code=new_code,
+                            name=new_name,
+                            aliases=new_aliases,
+                            blocked_terms=new_blocked,
+                            target_procedure_title=new_target,
+                            strict=new_strict,
+                            active=new_active,
+                        )
+                        audit(
+                            user["username"],
+                            "CREATE_BUSINESS_INTENT",
+                            f"{intent_id}:{new_code}",
+                        )
+                        st.success("Intención creada.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+    with tabs[3]:
         candidates = detect_procedure_candidates()
         st.metric("Candidatos detectados", len(candidates))
         for index, candidate in enumerate(candidates[:100]):

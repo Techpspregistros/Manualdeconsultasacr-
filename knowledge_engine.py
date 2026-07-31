@@ -29,10 +29,20 @@ def _loads_list(value: str | None) -> list[str]:
         return []
 
 
+def _clean_step(value: str) -> str:
+    clean = re.sub(r"\s+", " ", value or "").strip(" -•\t")
+    clean = re.sub(r"^\(?\d{1,3}\)?[\.\-\):]\s*", "", clean)
+    clean = re.sub(r"^\d{1,3}\s+(?=[A-Za-zÁÉÍÓÚÜÑáéíóúüñ])", "", clean)
+    return clean.strip()
+
+
 def _dumps_list(items: list[str] | str | None) -> str:
     if isinstance(items, str):
-        items = [line.strip(" -•\t") for line in items.splitlines() if line.strip()]
-    return json.dumps(items or [], ensure_ascii=False)
+        items = [_clean_step(line) for line in items.splitlines()]
+    else:
+        items = [_clean_step(str(item)) for item in (items or [])]
+    items = [item for item in items if item]
+    return json.dumps(items, ensure_ascii=False)
 
 
 def procedure_to_dict(row: Procedure) -> dict:

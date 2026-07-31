@@ -152,6 +152,37 @@ class KnowledgeRelation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class BusinessIntent(Base):
+    __tablename__ = "business_intents"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(180), index=True)
+    normalized_name: Mapped[str] = mapped_column(String(180), index=True)
+    aliases_json: Mapped[str] = mapped_column(Text, default="[]")
+    blocked_terms_json: Mapped[str] = mapped_column(Text, default="[]")
+    target_procedure_title: Mapped[str] = mapped_column(String(260), default="")
+    strict: Mapped[bool] = mapped_column(Boolean, default=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class ProcessLink(Base):
+    __tablename__ = "process_links"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_procedure_id: Mapped[int] = mapped_column(
+        ForeignKey("procedures.id", ondelete="CASCADE"), index=True
+    )
+    target_procedure_id: Mapped[int] = mapped_column(
+        ForeignKey("procedures.id", ondelete="CASCADE"), index=True
+    )
+    link_type: Mapped[str] = mapped_column(String(40), default="next", index=True)
+    label: Mapped[str] = mapped_column(String(180), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
