@@ -280,44 +280,90 @@ def search(question: str, limit: int = 8, categories: list[str] | None = None):
     return results, intent, confidence, elapsed_ms
 
 
+def _clean_for_summary(text: str) -> str:
+    """Remove common PDF noise while preserving the manual's wording."""
+    text = re.sub(r"P[aá]gina\s+\d+\s+de\s+\d+", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:p[aá]g(?:ina)?\.?\s*)\d+\b", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" .-–—")
+    return text
+
+
+def _sentence_candidates(text: str) -> list[str]:
+    cleaned = _clean_for_summary(text)
+    parts = re.split(r"(?<=[.!?;:])\s+|\s+[•▪◦]\s+", cleaned)
+    sentences = []
+    for part in parts:
+        part = part.strip(" -–—•▪◦\t\n")
+        if 35 <= len(part) <= 330 and len(tokenize(part)) >= 4:
+            sentences.append(part)
+    return sentences
+
+
+def concise_summary(question: str, texts: list[str], max_points: int = 3, max_chars: int = 700) -> list[str]:
+    """Create a short extractive answer using only sentences found in the sources."""
+    q_terms = set(expand_terms(tokenize(question)))
+    candidates: list[tuple[float, int, str]] = []
+    order = 0
+    for source_rank, text in enumerate(texts):
+        for sentence in _sentence_candidates(text):
+            terms = set(tokenize(sentence))
+            overlap = len(q_terms & terms)
+            if overlap == 0 and q_terms:
+                continue
+            score = overlap * 4.0
+            score += min(len(terms), 30) / 30
+            score += max(0, 2.0 - source_rank * 0.35)
+            if any(word in normalize(sentence) for word in ("debe", "seleccione", "ingrese", "registre", "verifique", "realice", "presione")):
+                score += 1.25
+            candidates.append((score, order, sentence))
+            order += 1
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    selected: list[tuple[int, str]] = []
+    used_norm: list[str] = []
+    total = 0
+    for _, original_order, sentence in candidates:
+        norm = normalize(sentence)
+        if any(SequenceMatcher(None, norm, previous).ratio() > 0.82 for previous in used_norm):
+            continue
+        projected = total + len(sentence)
+        if selected and projected > max_chars:
+            continue
+        selected.append((original_order, sentence))
+        used_norm.append(norm)
+        total = projected
+        if len(selected) >= max_points:
+            break
+
+    selected.sort(key=lambda item: item[0])
+    return [sentence for _, sentence in selected]
+
+
 def compose_answer(question: str, results: list[SearchResult], faq_match=None) -> str:
     if faq_match:
-        score, faq = faq_match
-        source = ""
-        if faq.document_name:
-            source = f"\n\n**Fuente aprobada:** {faq.document_name}"
-            if faq.page_number:
-                source += f", página PDF {faq.page_number}"
-            source += "."
-        return f"### Respuesta oficial\n\n{faq.answer}{source}\n\n_Confianza de coincidencia FAQ: {score:.0%}._"
+        _, faq = faq_match
+        points = concise_summary(question, [faq.answer], max_points=3, max_chars=650)
+        if not points:
+            answer = _clean_for_summary(faq.answer)
+            points = [answer[:650].rsplit(" ", 1)[0] + ("…" if len(answer) > 650 else "")]
+        return "### Respuesta breve\n\n" + "\n\n".join(f"- {point}" for point in points)
 
     if not results:
         return (
             "### No encontré una respuesta documentada\n\n"
-            "La pregunta quedó registrada para revisión. Incluya el nombre de la pantalla, "
-            "el botón, el número de proceso o el mensaje de error para mejorar la búsqueda."
+            "Describa la pantalla, el botón, el proceso o el mensaje de error para precisar la búsqueda."
         )
 
-    lines = [
-        "### Respuesta basada exclusivamente en la documentación",
-        f"**Pregunta:** {question}",
-        f"**Confianza:** {results[0].confidence}",
-        "",
-        "Revise estos pasos o referencias en el orden mostrado:",
-    ]
-    for i, r in enumerate(results[:4], 1):
-        lines += [
-            f"**{i}. {r.title}**",
-            r.excerpt,
-            f"_Fuente: {r.document_name}, página PDF {r.page_number}"
-            + (f", página interna {r.internal_page}._" if r.internal_page else "._"),
-            "",
-        ]
+    points = concise_summary(question, [r.excerpt for r in results[:4]], max_points=3, max_chars=700)
+    if not points:
+        fallback = _clean_for_summary(results[0].excerpt)
+        fallback = fallback[:700].rsplit(" ", 1)[0] + ("…" if len(fallback) > 700 else "")
+        points = [fallback]
+
+    answer = "### Respuesta breve\n\n" + "\n\n".join(f"- {point}" for point in points)
     if results[0].confidence == "Baja":
-        lines.append("> La coincidencia es débil. No aplique un procedimiento crítico sin verificar la página fuente.")
-    else:
-        lines.append("> El asistente no agrega pasos que no estén presentes en los documentos indexados.")
-    return "\n\n".join(lines)
+        answer += "\n\n_La coincidencia es limitada; confirme el procedimiento antes de aplicarlo._"
+    return answer
 
 
 def render_page(manual_dir: Path, filename: str, page_number: int) -> bytes:
