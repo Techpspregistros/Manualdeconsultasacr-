@@ -293,6 +293,9 @@ if view == "Asistente":
             st.markdown(message["content"])
 
     with c1:
+        if st.session_state.pop("clear_question", False):
+            st.session_state["question"] = ""
+
         question = st.text_area(
             "Pregunta",
             key="question",
@@ -355,7 +358,7 @@ if view == "Asistente":
             "answer": answer,
             "style": response_style,
         }
-        st.session_state["question"] = ""
+        st.session_state["clear_question"] = True
         st.rerun()
 
     last = st.session_state.get("last")
