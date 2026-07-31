@@ -21,8 +21,8 @@ from database import (
     db_session, init_db
 )
 from knowledge import (
-    compose_answer, delete_document, index_manual_directory, index_pdf, normalize, render_page,
-    search, search_faq, seed_synonyms, update_document_metadata
+    compose_answer, contextualize_question, delete_document, index_manual_directory, index_pdf,
+    normalize, render_page, search, search_faq, seed_synonyms, update_document_metadata
 )
 from security import hash_password, initial_admin_password, verify_password
 
@@ -190,7 +190,7 @@ def current_user():
 
 def login_screen():
     st.title("🧠 ARC+ Knowledge Assistant Enterprise")
-    st.caption("Plataforma inteligente de gestión del conocimiento — versión 6.0")
+    st.caption("Plataforma inteligente de gestión del conocimiento — versión 6.1")
     with st.form("login"):
         username = st.text_input("Usuario")
         password = st.text_input("Contraseña", type="password")
@@ -241,14 +241,41 @@ def categories():
 
 
 if view == "Asistente":
-    st.title("Asistente inteligente")
-    st.caption("Consulta varios manuales, muestra fuentes y registra aprendizaje supervisado.")
+    st.title("🤖 Asistente inteligente conversacional")
+    st.caption(
+        "Respuestas breves basadas en la biblioteca. Las fuentes se mantienen separadas "
+        "para que el audio lea únicamente la respuesta útil."
+    )
+
+    if "conversation" not in st.session_state:
+        st.session_state["conversation"] = []
 
     c1, c2 = st.columns([3, 1])
     with c2:
-        selected_categories = st.multiselect("Categorías", categories(), default=categories())
-        limit = st.slider("Resultados", 3, 12, 7)
-        show_pages = st.checkbox("Mostrar página del PDF", True)
+        selected_categories = st.multiselect(
+            "Categorías", categories(), default=categories()
+        )
+        response_style = st.selectbox(
+            "Estilo de respuesta",
+            ["Ejecutiva", "Normal", "Detallada", "Capacitación"],
+            index=1,
+            help=(
+                "Ejecutiva: 1–2 ideas. Normal: hasta 3 ideas. "
+                "Detallada: hasta 5 ideas. Capacitación: explicación más amplia."
+            ),
+        )
+        limit = st.slider("Fuentes a revisar", 3, 12, 7)
+        use_context = st.checkbox(
+            "Usar contexto de la conversación",
+            value=True,
+            help="Relaciona preguntas breves con el tema anterior.",
+        )
+        show_pages = st.checkbox("Mostrar imagen de la página fuente", False)
+        if st.button("🧹 Nueva conversación", use_container_width=True):
+            st.session_state["conversation"] = []
+            st.session_state.pop("last", None)
+            st.session_state["question"] = ""
+            st.rerun()
 
     examples = [
         "¿Cómo cierro un contrato?",
@@ -261,22 +288,48 @@ if view == "Asistente":
         if excols[i].button(item, use_container_width=True):
             st.session_state["question"] = item
 
+    for message in st.session_state["conversation"]:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
     with c1:
         question = st.text_area(
-            "Pregunta", key="question", height=110,
-            placeholder="Describa el proceso, pantalla, botón o mensaje de error."
+            "Pregunta",
+            key="question",
+            height=105,
+            placeholder="Describa el proceso, pantalla, botón o mensaje de error.",
         )
         ask = st.button("Consultar", type="primary")
 
     if ask and question.strip():
-        faq = search_faq(question)
-        results, intent, confidence, elapsed = search(
-            question, limit=limit, categories=selected_categories or None
+        visible_question = question.strip()
+        search_question = (
+            contextualize_question(visible_question, st.session_state["conversation"])
+            if use_context
+            else visible_question
         )
+
+        faq = search_faq(search_question)
+        results, intent, confidence, elapsed = search(
+            search_question,
+            limit=limit,
+            categories=selected_categories or None,
+        )
+        answer = compose_answer(
+            search_question,
+            results,
+            faq,
+            style=response_style,
+        )
+
         with db_session() as db:
             log = QueryLog(
-                user_id=user["id"], username=user["username"], agency=user["agency"],
-                question=question.strip(), intent=intent, confidence=confidence,
+                user_id=user["id"],
+                username=user["username"],
+                agency=user["agency"],
+                question=visible_question,
+                intent=intent,
+                confidence=confidence,
                 result_title=results[0].title if results else "",
                 document_name=results[0].document_name if results else "",
                 page_number=results[0].page_number if results else None,
@@ -285,27 +338,75 @@ if view == "Asistente":
             db.add(log)
             db.commit()
             query_id = log.id
+
+        st.session_state["conversation"].extend([
+            {"role": "user", "content": visible_question},
+            {"role": "assistant", "content": answer},
+        ])
         st.session_state["last"] = {
-            "question": question, "faq": faq, "results": results, "intent": intent,
-            "confidence": confidence, "elapsed": elapsed, "query_id": query_id,
-            "answer": compose_answer(question, results, faq)
+            "question": visible_question,
+            "search_question": search_question,
+            "faq": faq,
+            "results": results,
+            "intent": intent,
+            "confidence": confidence,
+            "elapsed": elapsed,
+            "query_id": query_id,
+            "answer": answer,
+            "style": response_style,
         }
+        st.session_state["question"] = ""
+        st.rerun()
 
     last = st.session_state.get("last")
     if last:
+        confidence_icons = {"Alta": "🟢", "Media": "🟡", "Baja": "🔴"}
         m1, m2, m3 = st.columns(3)
         m1.metric("Intención", last["intent"])
-        m2.metric("Confianza", last["confidence"])
+        m2.metric(
+            "Confianza",
+            f"{confidence_icons.get(last['confidence'], '⚪')} {last['confidence']}",
+        )
         m3.metric("Tiempo", f"{last['elapsed']} ms")
-        st.markdown(last["answer"])
+
         render_audio_reader(last["answer"], key=f"answer_{last['query_id']}")
 
         text_export = (
-            f"ARC+ ENTERPRISE V4\nFecha: {datetime.now():%Y-%m-%d %H:%M}\n"
+            f"ARC+ ENTERPRISE V6\nFecha: {datetime.now():%Y-%m-%d %H:%M}\n"
             f"Usuario: {user['username']}\nPregunta: {last['question']}\n\n"
-            + last["answer"].replace("### ", "").replace("**", "").replace("_", "")
+            + answer_to_plain_text(last["answer"])
         )
-        st.download_button("Descargar respuesta", text_export, "respuesta_arcplus.txt", "text/plain")
+        st.download_button(
+            "Descargar respuesta",
+            text_export,
+            "respuesta_arcplus.txt",
+            "text/plain",
+        )
+
+        with st.expander("📚 Ver fuentes utilizadas", expanded=False):
+            if not last["results"]:
+                st.info("No se localizaron fuentes documentales suficientes.")
+            for i, r in enumerate(last["results"], 1):
+                st.markdown(f"**{i}. {r.title}**")
+                st.caption(f"Documento: {r.document_name}")
+                st.write(r.excerpt)
+                st.caption("Coincidencias: " + ", ".join(r.matches))
+                if show_pages:
+                    try:
+                        st.image(
+                            render_page(MANUALS, r.filename, r.page_number),
+                            caption=f"Vista de la fuente {i}",
+                            use_container_width=True,
+                        )
+                    except Exception as exc:
+                        st.warning(f"No se pudo mostrar la página: {exc}")
+                st.divider()
+
+        if last["confidence"] == "Baja":
+            st.warning(
+                "La coincidencia documental es limitada. Revise las fuentes antes de "
+                "aplicar un procedimiento crítico."
+            )
 
         st.divider()
         st.subheader("Retroalimentación")
@@ -313,40 +414,37 @@ if view == "Asistente":
             "¿La respuesta resolvió la consulta?",
             ["Resuelta", "Parcial", "No resuelta", "Incorrecta"],
             horizontal=True,
+            key=f"rating_{last['query_id']}",
         )
-        comment = st.text_area("Comentario opcional")
-        solution = st.text_area("¿Cómo se resolvió finalmente? (útil para aprendizaje)")
-        if st.button("Guardar retroalimentación"):
+        comment = st.text_area(
+            "Comentario opcional",
+            key=f"comment_{last['query_id']}",
+        )
+        solution = st.text_area(
+            "¿Cómo se resolvió finalmente? (útil para aprendizaje)",
+            key=f"solution_{last['query_id']}",
+        )
+        if st.button(
+            "Guardar retroalimentación",
+            key=f"save_feedback_{last['query_id']}",
+        ):
             with db_session() as db:
                 db.add(Feedback(
-                    query_id=last["query_id"], rating=rating,
-                    comment=comment.strip(), final_solution=solution.strip()
+                    query_id=last["query_id"],
+                    rating=rating,
+                    comment=comment.strip(),
+                    final_solution=solution.strip(),
                 ))
                 if rating == "Resuelta":
                     log = db.get(QueryLog, last["query_id"])
                     log.resolved = True
                 db.commit()
-            audit(user["username"], "FEEDBACK", f"Consulta {last['query_id']}: {rating}")
+            audit(
+                user["username"],
+                "FEEDBACK",
+                f"Consulta {last['query_id']}: {rating}",
+            )
             st.success("Retroalimentación guardada para revisión.")
-
-        st.divider()
-        st.subheader("Fuentes")
-        for i, r in enumerate(last["results"], 1):
-            label = f"{i}. {r.title} — {r.document_name} — pág. {r.page_number}"
-            with st.expander(label, expanded=(i == 1)):
-                st.write(r.excerpt)
-                st.caption("Coincidencias: " + ", ".join(r.matches))
-                if show_pages:
-                    try:
-                        with db_session() as db:
-                            document = db.scalar(select(Document).where(Document.name == r.document_name))
-                        st.image(
-                            render_page(MANUALS, document.filename, r.page_number),
-                            caption=f"{r.document_name}, página {r.page_number}",
-                            use_container_width=True,
-                        )
-                    except Exception as exc:
-                        st.warning(f"No se pudo mostrar la página: {exc}")
 
 elif view == "Biblioteca":
     st.title("📚 Biblioteca inteligente")

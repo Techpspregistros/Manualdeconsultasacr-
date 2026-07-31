@@ -341,31 +341,91 @@ def concise_summary(question: str, texts: list[str], max_points: int = 3, max_ch
     return [sentence for _, sentence in selected]
 
 
-def compose_answer(question: str, results: list[SearchResult], faq_match=None) -> str:
+FOLLOW_UP_MARKERS = (
+    "y si", "y quien", "y quién", "y donde", "y dónde", "y cuando", "y cuándo",
+    "y cual", "y cuál", "y como", "y cómo", "ademas", "además", "tambien", "también",
+    "en ese caso", "entonces", "eso", "este proceso", "ese proceso", "lo anterior",
+)
+
+
+def contextualize_question(question: str, history: list[dict] | None = None) -> str:
+    """Add the latest user topic to short follow-up questions without changing the displayed question."""
+    clean = (question or "").strip()
+    if not history:
+        return clean
+
+    normalized = normalize(clean)
+    is_follow_up = (
+        len(tokenize(clean)) <= 6
+        or any(normalized.startswith(normalize(marker)) for marker in FOLLOW_UP_MARKERS)
+    )
+    if not is_follow_up:
+        return clean
+
+    previous_questions = [
+        item.get("content", "").strip()
+        for item in reversed(history)
+        if item.get("role") == "user" and item.get("content", "").strip()
+    ]
+    if not previous_questions:
+        return clean
+
+    previous = previous_questions[0]
+    if normalize(previous) == normalized:
+        return clean
+    return f"{previous}. Pregunta de seguimiento: {clean}"
+
+
+def response_style_limits(style: str) -> tuple[int, int]:
+    styles = {
+        "Ejecutiva": (2, 360),
+        "Normal": (3, 700),
+        "Detallada": (5, 1250),
+        "Capacitación": (6, 1550),
+    }
+    return styles.get(style, styles["Normal"])
+
+
+def compose_answer(
+    question: str,
+    results: list[SearchResult],
+    faq_match=None,
+    style: str = "Normal",
+) -> str:
+    """Create a concise extractive answer without page numbers or source metadata."""
+    max_points, max_chars = response_style_limits(style)
+
     if faq_match:
         _, faq = faq_match
-        points = concise_summary(question, [faq.answer], max_points=3, max_chars=650)
-        if not points:
-            answer = _clean_for_summary(faq.answer)
-            points = [answer[:650].rsplit(" ", 1)[0] + ("…" if len(answer) > 650 else "")]
-        return "### Respuesta breve\n\n" + "\n\n".join(f"- {point}" for point in points)
+        source_texts = [faq.answer]
+    else:
+        source_texts = [r.excerpt for r in results[:6]]
 
-    if not results:
+    if not source_texts:
         return (
-            "### No encontré una respuesta documentada\n\n"
-            "Describa la pantalla, el botón, el proceso o el mensaje de error para precisar la búsqueda."
+            "### Respuesta\n\n"
+            "No encontré información suficiente en la biblioteca. "
+            "Describa la pantalla, el botón, el proceso o el mensaje de error."
         )
 
-    points = concise_summary(question, [r.excerpt for r in results[:4]], max_points=3, max_chars=700)
+    points = concise_summary(
+        question,
+        source_texts,
+        max_points=max_points,
+        max_chars=max_chars,
+    )
     if not points:
-        fallback = _clean_for_summary(results[0].excerpt)
-        fallback = fallback[:700].rsplit(" ", 1)[0] + ("…" if len(fallback) > 700 else "")
-        points = [fallback]
+        fallback = _clean_for_summary(source_texts[0])
+        shortened = fallback[:max_chars]
+        if len(fallback) > max_chars:
+            shortened = shortened.rsplit(" ", 1)[0] + "…"
+        points = [shortened]
 
-    answer = "### Respuesta breve\n\n" + "\n\n".join(f"- {point}" for point in points)
-    if results[0].confidence == "Baja":
-        answer += "\n\n_La coincidencia es limitada; confirme el procedimiento antes de aplicarlo._"
-    return answer
+    heading = "### Respuesta"
+    if style == "Capacitación":
+        heading = "### Guía resumida"
+
+    return heading + "\n\n" + "\n\n".join(f"- {point}" for point in points)
 
 
 def render_page(manual_dir: Path, filename: str, page_number: int) -> bytes:
