@@ -5,6 +5,7 @@ import math
 import re
 import time
 import unicodedata
+from datetime import datetime
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -118,6 +119,7 @@ def index_pdf(path: Path, name: str | None = None, category: str = "General", ve
             document.version = version
             document.page_count = len(doc)
             document.active = True
+            document.indexed_at = datetime.utcnow()
         else:
             document = Document(
                 name=name, filename=path.name, category=category,
@@ -373,3 +375,47 @@ def render_page(manual_dir: Path, filename: str, page_number: int) -> bytes:
     data = pix.tobytes("png")
     doc.close()
     return data
+
+
+def update_document_metadata(document_id: int, name: str, category: str, version: str, active: bool) -> None:
+    """Update document metadata without rebuilding its page index."""
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("El nombre del documento es obligatorio.")
+    with db_session() as db:
+        document = db.get(Document, document_id)
+        if not document:
+            raise ValueError("El documento ya no existe.")
+        duplicate = db.scalar(
+            select(Document).where(Document.name == clean_name, Document.id != document_id)
+        )
+        if duplicate:
+            raise ValueError("Ya existe otro documento con ese nombre.")
+        document.name = clean_name
+        document.category = (category or "General").strip() or "General"
+        document.version = (version or "").strip()
+        document.active = bool(active)
+        db.commit()
+
+
+def delete_document(document_id: int, manuals_directory: Path, delete_file: bool = True) -> tuple[str, bool]:
+    """Delete a document and its index; remove the PDF only when no other record uses it."""
+    with db_session() as db:
+        document = db.get(Document, document_id)
+        if not document:
+            raise ValueError("El documento ya no existe.")
+        filename = document.filename
+        name = document.name
+        db.execute(delete(DocumentPage).where(DocumentPage.document_id == document_id))
+        db.delete(document)
+        db.commit()
+
+    removed_file = False
+    if delete_file:
+        with db_session() as db:
+            still_used = db.scalar(select(Document).where(Document.filename == filename))
+        path = manuals_directory / filename
+        if not still_used and path.exists():
+            path.unlink()
+            removed_file = True
+    return name, removed_file

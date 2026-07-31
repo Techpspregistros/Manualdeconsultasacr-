@@ -21,8 +21,8 @@ from database import (
     db_session, init_db
 )
 from knowledge import (
-    compose_answer, index_manual_directory, index_pdf, normalize, render_page,
-    search, search_faq, seed_synonyms
+    compose_answer, delete_document, index_manual_directory, index_pdf, normalize, render_page,
+    search, search_faq, seed_synonyms, update_document_metadata
 )
 from security import hash_password, initial_admin_password, verify_password
 
@@ -33,7 +33,7 @@ DATA = BASE / "data"
 MANUALS.mkdir(exist_ok=True)
 DATA.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="ARC+ Enterprise v4", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="ARC+ Enterprise v6", page_icon="🧠", layout="wide")
 
 st.markdown("""
 <style>
@@ -190,7 +190,7 @@ def current_user():
 
 def login_screen():
     st.title("🧠 ARC+ Knowledge Assistant Enterprise")
-    st.caption("Plataforma privada de conocimiento operativo — versión 4.0 MVP")
+    st.caption("Plataforma inteligente de gestión del conocimiento — versión 6.0")
     with st.form("login"):
         username = st.text_input("Usuario")
         password = st.text_input("Contraseña", type="password")
@@ -349,35 +349,172 @@ if view == "Asistente":
                         st.warning(f"No se pudo mostrar la página: {exc}")
 
 elif view == "Biblioteca":
-    st.title("Biblioteca de conocimiento")
+    st.title("📚 Biblioteca inteligente")
+    st.caption("Administre, consulte, actualice y elimine los manuales disponibles para el asistente.")
+
     with db_session() as db:
-        docs = db.scalars(select(Document).order_by(Document.category, Document.name)).all()
+        all_docs = db.scalars(select(Document).order_by(Document.category, Document.name)).all()
+
+    total_pages = sum(d.page_count or 0 for d in all_docs)
+    active_docs = sum(1 for d in all_docs if d.active)
+    total_bytes = 0
+    for d in all_docs:
+        pdf_path = MANUALS / d.filename
+        if pdf_path.exists():
+            total_bytes += pdf_path.stat().st_size
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Manuales", len(all_docs))
+    m2.metric("Activos", active_docs)
+    m3.metric("Páginas indexadas", total_pages)
+    m4.metric("Espacio utilizado", f"{total_bytes / (1024 * 1024):.1f} MB")
+
+    query = st.text_input("🔍 Buscar manual", placeholder="Nombre, categoría, versión o archivo…")
+    q = normalize(query)
+    docs = [
+        d for d in all_docs
+        if not q or q in normalize(f"{d.name} {d.category} {d.version} {d.filename}")
+    ]
+
     if docs:
-        df = pd.DataFrame([{
-            "ID": d.id, "Documento": d.name, "Categoría": d.category,
-            "Versión": d.version, "Páginas": d.page_count,
-            "Activo": d.active, "Indexado": d.indexed_at
-        } for d in docs])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.subheader(f"Documentos ({len(docs)})")
+        for d in docs:
+            status = "✅ Activo" if d.active else "⏸ Inactivo"
+            version_label = f" · v{d.version}" if d.version else ""
+            with st.expander(f"📄 {d.name}{version_label} — {status}"):
+                info1, info2, info3, info4 = st.columns(4)
+                info1.caption("Categoría")
+                info1.write(d.category or "General")
+                info2.caption("Páginas")
+                info2.write(d.page_count)
+                info3.caption("Archivo")
+                info3.write(d.filename)
+                info4.caption("Última indexación")
+                info4.write(d.indexed_at.strftime("%d/%m/%Y %H:%M") if d.indexed_at else "—")
+
+                pdf_path = MANUALS / d.filename
+                a1, a2, a3, a4 = st.columns(4)
+                if a1.button("👁 Ver", key=f"view_doc_{d.id}", use_container_width=True):
+                    st.session_state[f"show_doc_{d.id}"] = not st.session_state.get(f"show_doc_{d.id}", False)
+                if pdf_path.exists():
+                    a2.download_button(
+                        "📥 Descargar", data=pdf_path.read_bytes(), file_name=d.filename,
+                        mime="application/pdf", key=f"download_doc_{d.id}", use_container_width=True,
+                    )
+                else:
+                    a2.button("📥 No disponible", disabled=True, key=f"missing_doc_{d.id}", use_container_width=True)
+
+                if user["role"] == "admin":
+                    if a3.button("🔄 Reindexar", key=f"reindex_doc_{d.id}", use_container_width=True):
+                        if not pdf_path.exists():
+                            st.error("No se encontró el PDF original en la carpeta manuals.")
+                        else:
+                            with st.spinner("Reconstruyendo el índice…"):
+                                index_pdf(pdf_path, name=d.name, category=d.category, version=d.version)
+                            audit(user["username"], "REINDEX_DOCUMENT", d.name)
+                            st.success("Documento reindexado correctamente.")
+                            st.rerun()
+                    if a4.button("🗑 Eliminar", key=f"ask_delete_doc_{d.id}", use_container_width=True):
+                        st.session_state["confirm_delete_document"] = d.id
+
+                if st.session_state.get(f"show_doc_{d.id}"):
+                    if pdf_path.exists():
+                        try:
+                            st.image(
+                                render_page(MANUALS, d.filename, 1),
+                                caption=f"Vista previa de {d.name} — primera página",
+                                use_container_width=True,
+                            )
+                            st.caption("Use Descargar para abrir o guardar el PDF completo.")
+                        except Exception as exc:
+                            st.warning(f"No se pudo generar la vista previa: {exc}")
+                    else:
+                        st.warning("El registro existe, pero el archivo PDF no está disponible.")
+
+                if user["role"] == "admin":
+                    with st.form(f"edit_document_{d.id}"):
+                        st.markdown("**✏ Editar información**")
+                        e1, e2, e3, e4 = st.columns([2, 1.3, 1, 0.8])
+                        edited_name = e1.text_input("Nombre", value=d.name, key=f"name_{d.id}")
+                        edited_category = e2.text_input("Categoría", value=d.category, key=f"category_{d.id}")
+                        edited_version = e3.text_input("Versión", value=d.version, key=f"version_{d.id}")
+                        edited_active = e4.checkbox("Activo", value=d.active, key=f"active_{d.id}")
+                        save_metadata = st.form_submit_button("Guardar cambios")
+                    if save_metadata:
+                        try:
+                            update_document_metadata(
+                                d.id, edited_name, edited_category, edited_version, edited_active
+                            )
+                            audit(user["username"], "UPDATE_DOCUMENT", f"ID {d.id}: {edited_name}")
+                            st.success("Información actualizada.")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+
+                if st.session_state.get("confirm_delete_document") == d.id and user["role"] == "admin":
+                    st.warning(
+                        "Esta acción eliminará el manual de la biblioteca, todas sus páginas indexadas "
+                        "y el PDF almacenado. No se puede deshacer."
+                    )
+                    c_yes, c_no = st.columns(2)
+                    if c_yes.button("Sí, eliminar definitivamente", type="primary", key=f"confirm_delete_{d.id}", use_container_width=True):
+                        try:
+                            deleted_name, removed_file = delete_document(d.id, MANUALS, delete_file=True)
+                            audit(
+                                user["username"], "DELETE_DOCUMENT",
+                                f"{deleted_name}; PDF eliminado: {removed_file}",
+                            )
+                            st.session_state.pop("confirm_delete_document", None)
+                            st.success(f"Se eliminó “{deleted_name}” correctamente.")
+                            st.rerun()
+                        except (ValueError, OSError) as exc:
+                            st.error(f"No se pudo eliminar el documento: {exc}")
+                    if c_no.button("Cancelar", key=f"cancel_delete_{d.id}", use_container_width=True):
+                        st.session_state.pop("confirm_delete_document", None)
+                        st.rerun()
     else:
-        st.info("No hay documentos indexados.")
+        st.info("No hay documentos que coincidan con la búsqueda.")
 
     if user["role"] == "admin":
-        st.subheader("Agregar o actualizar documento")
-        uploaded = st.file_uploader("PDF", type=["pdf"])
-        c1, c2, c3 = st.columns(3)
-        name = c1.text_input("Nombre documental")
-        category = c2.text_input("Categoría", value="General")
-        version = c3.text_input("Versión")
-        if st.button("Guardar e indexar", type="primary") and uploaded:
-            safe_name = Path(uploaded.name).name
-            target = MANUALS / safe_name
-            target.write_bytes(uploaded.getbuffer())
-            index_pdf(target, name=name.strip() or target.stem, category=category.strip(), version=version.strip())
-            audit(user["username"], "INDEX_DOCUMENT", safe_name)
-            st.cache_resource.clear()
-            st.success("Documento guardado e indexado.")
-            st.rerun()
+        st.divider()
+        st.subheader("➕ Agregar o actualizar documento")
+        with st.form("upload_document", clear_on_submit=True):
+            uploaded = st.file_uploader("Archivo PDF", type=["pdf"])
+            c1, c2, c3 = st.columns([2, 1.3, 1])
+            name = c1.text_input("Nombre documental")
+            category = c2.text_input("Categoría", value="General")
+            version = c3.text_input("Versión")
+            mode = st.radio(
+                "Si ya existe un documento con el mismo nombre",
+                ["Reemplazar y reindexar", "Crear como nueva versión"],
+                horizontal=True,
+            )
+            submitted_document = st.form_submit_button("Guardar e indexar", type="primary")
+
+        if submitted_document:
+            if not uploaded:
+                st.error("Seleccione un archivo PDF.")
+            else:
+                safe_name = Path(uploaded.name).name
+                requested_name = name.strip() or Path(safe_name).stem
+                with db_session() as db:
+                    existing = db.scalar(select(Document).where(Document.name == requested_name))
+                final_name = requested_name
+                if existing and mode == "Crear como nueva versión":
+                    suffix = version.strip() or datetime.now().strftime("%Y%m%d-%H%M")
+                    final_name = f"{requested_name} - v{suffix}"
+                target = MANUALS / safe_name
+                if existing and mode == "Crear como nueva versión" and target.exists():
+                    target = MANUALS / f"{target.stem}_{datetime.now().strftime('%Y%m%d%H%M%S')}{target.suffix}"
+                target.write_bytes(uploaded.getbuffer())
+                with st.spinner("Indexando el manual…"):
+                    index_pdf(
+                        target, name=final_name,
+                        category=category.strip() or "General", version=version.strip(),
+                    )
+                audit(user["username"], "INDEX_DOCUMENT", f"{final_name} ({target.name})")
+                st.success("Documento guardado e indexado.")
+                st.rerun()
 
 elif view == "Mi historial":
     st.title("Mi historial")
