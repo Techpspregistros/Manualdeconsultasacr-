@@ -26,6 +26,8 @@ from knowledge import (
 )
 from security import hash_password, initial_admin_password, verify_password
 from quality import promote_feedback_to_faq, quality_metrics, recurring_unresolved, similar_questions
+from knowledge_router import answer_question
+from database_manager import create_backup, database_report, export_report_json
 from knowledge_engine import (
     compose_procedure_answer, delete_procedure, detect_procedure_candidates,
     import_candidate, list_procedures, procedure_to_dict, save_procedure,
@@ -44,7 +46,7 @@ DATA = BASE / "data"
 MANUALS.mkdir(exist_ok=True)
 DATA.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="ARC+ Enterprise v8.1", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="ARC+ Enterprise v9", page_icon="🧠", layout="wide")
 
 st.markdown("""
 <style>
@@ -201,7 +203,7 @@ def current_user():
 
 def login_screen():
     st.title("🧠 ARC+ Knowledge Assistant Enterprise")
-    st.caption("Plataforma inteligente de gestión del conocimiento — versión 8.1")
+    st.caption("Plataforma inteligente de gestión del conocimiento — versión 9.0")
     with st.form("login"):
         username = st.text_input("Usuario")
         password = st.text_input("Contraseña", type="password")
@@ -239,7 +241,7 @@ with st.sidebar:
     if user["role"] in ("supervisor", "admin"):
         options += ["Centro de conocimiento"]
     if user["role"] == "admin":
-        options += ["Aprendizaje", "Usuarios", "Auditoría"]
+        options += ["Aprendizaje", "Usuarios", "Mantenimiento de datos", "Auditoría"]
     view = st.radio("Módulos", options)
     st.divider()
     if st.button("Cerrar sesión", use_container_width=True):
@@ -325,41 +327,20 @@ if view == "Asistente":
             else visible_question
         )
 
-        faq = search_faq(search_question)
-        route = route_question(search_question) if not faq else None
-        procedure_match = route.procedure if route else None
-
-        results, intent, confidence, elapsed = search(
+        routed = answer_question(
             search_question,
+            style=response_style,
             limit=limit,
             categories=selected_categories or None,
         )
-
-        if faq:
-            answer = compose_answer(
-                search_question, results, faq, style=response_style
-            )
-            answer_origin = "Respuesta oficial"
-        elif route and route.route == "procedure" and procedure_match:
-            answer = compose_procedure_answer(
-                procedure_match, style=response_style
-            )
-            confidence = procedure_match.confidence
-            intent = f"Proceso: {route.intent.name}"
-            answer_origin = "Proceso de negocio estructurado"
-        elif route and route.route == "blocked":
-            answer = "### Conocimiento pendiente de aprobación\n\n" + route.message
-            confidence = "Baja"
-            intent = f"Proceso detectado: {route.intent.name}"
-            answer_origin = "Protección contra respuesta incorrecta"
-            results = []
-        else:
-            answer = compose_answer(
-                search_question, results, None, style=response_style
-            )
-            if route and route.intent:
-                intent = f"Proceso detectado: {route.intent.name}"
-            answer_origin = "Búsqueda documental"
+        answer = routed.answer
+        answer_origin = routed.origin
+        intent = routed.intent_label
+        confidence = routed.confidence
+        elapsed = routed.elapsed_ms
+        results = routed.results
+        procedure_match = None
+        faq = routed.faq_match
 
         with db_session() as db:
             log = QueryLog(
@@ -393,14 +374,10 @@ if view == "Asistente":
             "query_id": query_id,
             "answer": answer,
             "style": response_style,
-            "procedure": procedure_to_dict(procedure_match.procedure) if procedure_match else None,
+            "procedure": routed.procedure,
             "answer_origin": answer_origin,
-            "business_intent": {
-                "code": route.intent.code,
-                "name": route.intent.name,
-                "score": route.intent.score,
-                "matched_alias": route.intent.matched_alias,
-            } if route and route.intent else None,
+            "business_intent": routed.business_intent,
+            "router_warnings": routed.warnings or [],
         }
         st.session_state["clear_question"] = True
         st.rerun()
@@ -418,6 +395,9 @@ if view == "Asistente":
         st.caption(
             f"Origen de la respuesta: **{last.get('answer_origin', 'Búsqueda documental')}**"
         )
+        for router_warning in last.get("router_warnings", []):
+            st.warning(router_warning)
+
         business_intent = last.get("business_intent")
         if business_intent:
             st.caption(
@@ -1284,6 +1264,61 @@ elif view == "Usuarios":
             db.commit()
         audit(user["username"], "CHANGE_PASSWORD")
         st.success("Contraseña actualizada.")
+
+elif view == "Mantenimiento de datos":
+    st.title("🛡️ Mantenimiento de datos")
+    report = database_report()
+    counts = report["counts"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Usuarios", counts.get("users", 0))
+    c2.metric("Procedimientos", counts.get("procedures", 0))
+    c3.metric("Documentos", counts.get("documents", 0))
+    c4.metric("Consultas", counts.get("query_logs", 0))
+
+    st.write(f"**Tipo de base:** {report['database_url_type']}")
+    st.write(f"**Ruta utilizada:** `{report['database_path']}`")
+    st.write(f"**Existe:** {'Sí' if report['exists'] else 'No'}")
+    st.write(f"**Tamaño:** {report['size_bytes'] / 1024 / 1024:.3f} MB")
+
+    st.dataframe(
+        pd.DataFrame([
+            {"Tabla": name, "Registros": count}
+            for name, count in sorted(counts.items())
+        ]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if st.button("Crear respaldo SQLite"):
+        try:
+            backup_path = create_backup(f"manual_{user['username']}")
+            st.session_state["v9_backup"] = str(backup_path)
+            audit(
+                user["username"],
+                "CREATE_DATABASE_BACKUP",
+                backup_path.name,
+            )
+            st.success(f"Respaldo creado: {backup_path.name}")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    backup_name = st.session_state.get("v9_backup")
+    if backup_name and Path(backup_name).exists():
+        backup_path = Path(backup_name)
+        st.download_button(
+            "Descargar respaldo",
+            backup_path.read_bytes(),
+            file_name=backup_path.name,
+            mime="application/octet-stream",
+        )
+
+    st.download_button(
+        "Descargar diagnóstico JSON",
+        export_report_json(),
+        file_name=f"arcplus_diagnostico_{datetime.now():%Y%m%d_%H%M%S}.json",
+        mime="application/json",
+    )
 
 elif view == "Auditoría":
     st.title("Auditoría")
